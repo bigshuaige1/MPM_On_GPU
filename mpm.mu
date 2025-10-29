@@ -3,8 +3,8 @@
 #include <string>
 #include <fstream>
 #include <sstream>
-#include <cuda_runtime.h>
-#include <iomanip>
+#include <musa_runtime.h>
+#include <map>
 #include "svd3.h"
 
 const float total_volume = 0.567921f;
@@ -19,10 +19,11 @@ const float h_mu = E / (2.f * (1.f + nu));
 const float h_lambda = E * nu / ((1.f + nu) * (1.f - 2.f * nu));
 const float h_gravity = -1.f;
 const int h_n_grid = 150;
-const int h_num_steps = 60;            
-const int h_substeps_per_step = 240;  
+const int h_num_steps = 120;           
+const int h_substeps_per_step = 60;   
 
 const int num_grid_cells = h_n_grid * h_n_grid * h_n_grid;
+
 
 __device__ __constant__ float one_over_dx;
 __device__ __constant__ float dx;
@@ -39,12 +40,11 @@ __device__ __constant__ int num_g;
 int read_from_obj(const std::string& obj_path, std::vector<float>& x_p);
 void init_solver(float *&x_p, const std::vector<float>& h_x_p, float *&v_p, float *&F_p, float *&B_p, float *&m_i, float *&v_i, float *&f_i, int h_num_p, int h_num_g);
 void substep(float *x_p, float *v_p, float *F_p, float *B_p, float *m_i, float *v_i, float *f_i, int h_num_p, int h_num_g);
-void export_to_obj(const std::string& obj_path, float *d_x_p, int num_p);
 
 // #include <filesystem>
 int main() {
     // std::cout << std::filesystem::current_path() << std::endl;
-    std::cout << "cuda" << std::endl;
+    std::cout << "musa" << std::endl;
     std::vector<float> h_x_p;
     int h_num_p = read_from_obj("./two_dragons.obj", h_x_p);
     // int h_num_p = read_from_obj("assets/two_dragons.obj", h_x_p);
@@ -61,61 +61,10 @@ int main() {
     std::cout << "Start simulate" << std::endl;
     std::cout << "Total steps: " << h_num_steps << ", substeps per step: " << h_substeps_per_step << std::endl;
 
-    cudaEvent_t step_start, step_end;
-    cudaEventCreate(&step_start);
-    cudaEventCreate(&step_end);
-
-    std::vector<float> step_times_ms;
-    step_times_ms.reserve(h_num_steps);
-    double total_time_ms_accum = 0.0;
-
     for (int frame = 0; frame < h_num_steps; frame++) {
-        cudaEventRecord(step_start, 0);
-
         for (int s = 0; s < h_substeps_per_step; s++) {
             substep(x_p, v_p, F_p, B_p, m_i, v_i, f_i, h_num_p, num_grid_cells);
-            cudaDeviceSynchronize();
-        }
-
-        cudaEventRecord(step_end, 0);
-        cudaEventSynchronize(step_end);
-        float step_ms = 0.f;
-        cudaEventElapsedTime(&step_ms, step_start, step_end);
-
-        export_to_obj("res/res_" + std::to_string(frame + 1) + ".obj", x_p, h_num_p);
-        std::printf("step %d/%d time: %.3f ms (substeps: %d)\n", frame + 1, h_num_steps, step_ms, h_substeps_per_step);
-
-        step_times_ms.push_back(step_ms);
-        total_time_ms_accum += static_cast<double>(step_ms);
-    }
-
-    cudaEventDestroy(step_start);
-    cudaEventDestroy(step_end);
-
-    // 输出总耗时到控制台
-    std::printf("Total runtime (sum of steps): %.3f ms\n", static_cast<float>(total_time_ms_accum));
-
-    // 将统计信息写入 JSON 文件
-    {
-        std::ofstream json_file("res/timings.json");
-        if (json_file.is_open()) {
-            json_file << std::fixed << std::setprecision(3);
-            json_file << "{\n";
-            json_file << "  \"total_steps\": " << h_num_steps << ",\n";
-            json_file << "  \"substeps_per_step\": " << h_substeps_per_step << ",\n";
-            json_file << "  \"total_time_ms\": " << total_time_ms_accum << ",\n";
-            json_file << "  \"steps\": [\n";
-            for (int i = 0; i < (int)step_times_ms.size(); ++i) {
-                json_file << "    { \"step\": " << (i + 1) << ", \"time_ms\": " << step_times_ms[i] << " }";
-                if (i + 1 < (int)step_times_ms.size()) json_file << ",";
-                json_file << "\n";
-            }
-            json_file << "  ]\n";
-            json_file << "}\n";
-            json_file.close();
-            std::cout << "Timings written to res/timings.json" << std::endl;
-        } else {
-            std::cerr << "Failed to open res/timings.json for writing" << std::endl;
+            musaDeviceSynchronize();
         }
     }
 
@@ -509,79 +458,42 @@ __global__ void g2p(float *grid_velocity, float *particles_position, float *part
 void init_solver(float *&x_p, const std::vector<float>& h_x_p, float *&v_p, float *&F_p, float *&B_p, float *&m_i, float *&v_i, float *&f_i, int h_num_p, int h_num_g) {
     float h_m_p = total_mass / h_num_p;
     float h_V_p = total_volume / h_num_p;
-    cudaMemcpyToSymbol(one_over_dx, &h_one_over_dx, 4);
-    cudaMemcpyToSymbol(dx, &h_dx, 4);
-    cudaMemcpyToSymbol(dt, &h_dt, 4);
-    cudaMemcpyToSymbol(mu, &h_mu, 4);
-    cudaMemcpyToSymbol(lambda, &h_lambda, 4);
-    cudaMemcpyToSymbol(gravity, &h_gravity, 4);
-    cudaMemcpyToSymbol(m_p, &h_m_p, 4);
-    cudaMemcpyToSymbol(V_p, &h_V_p, 4);
-    cudaMemcpyToSymbol(n_grid, &h_n_grid, 4);
-    cudaMemcpyToSymbol(num_p, &h_num_p, 4);
-    cudaMemcpyToSymbol(num_g, &h_num_g, 4);
+    musaMemcpyToSymbol(one_over_dx, &h_one_over_dx, 4);
+    musaMemcpyToSymbol(dx, &h_dx, 4);
+    musaMemcpyToSymbol(dt, &h_dt, 4);
+    musaMemcpyToSymbol(mu, &h_mu, 4);
+    musaMemcpyToSymbol(lambda, &h_lambda, 4);
+    musaMemcpyToSymbol(gravity, &h_gravity, 4);
+    musaMemcpyToSymbol(m_p, &h_m_p, 4);
+    musaMemcpyToSymbol(V_p, &h_V_p, 4);
+    musaMemcpyToSymbol(n_grid, &h_n_grid, 4);
+    musaMemcpyToSymbol(num_p, &h_num_p, 4);
+    musaMemcpyToSymbol(num_g, &h_num_g, 4);
 
-    cudaMalloc(&x_p, h_num_p * 3 * 4);
-    cudaMemcpy(x_p, h_x_p.data(), h_num_p * 3 * 4, cudaMemcpyHostToDevice);
+    musaMalloc(&x_p, h_num_p * 3 * 4);
+    musaMemcpy(x_p, h_x_p.data(), h_num_p * 3 * 4, musaMemcpyHostToDevice);
 
-    cudaMalloc(&v_p, h_num_p * 3 * 4);
-    cudaMalloc(&F_p, h_num_p * 9 * 4);
+    musaMalloc(&v_p, h_num_p * 3 * 4);
+    musaMalloc(&F_p, h_num_p * 9 * 4);
     init_particles<<<(h_num_p + 255) / 256, 256>>>(x_p,  v_p, F_p);
-    cudaMalloc(&B_p, h_num_p * 9 * 4);
+    musaMalloc(&B_p, h_num_p * 9 * 4);
 
-    cudaMalloc(&m_i, h_num_g * 4);
-    cudaMalloc(&v_i, h_num_g * 3 * 4);
-    cudaMalloc(&f_i, h_num_g * 3 * 4);
+    musaMalloc(&m_i, h_num_g * 4);
+    musaMalloc(&v_i, h_num_g * 3 * 4);
+    musaMalloc(&f_i, h_num_g * 3 * 4);
 }
 
 void substep(float *x_p, float *v_p, float *F_p, float *B_p, float *m_i, float *v_i, float *f_i, int h_num_p, int h_num_g) {
-    cudaEvent_t e_start, e_after_reset, e_after_p2g, e_after_update, e_after_g2p;
-    cudaEventCreate(&e_start);
-    cudaEventCreate(&e_after_reset);
-    cudaEventCreate(&e_after_p2g);
-    cudaEventCreate(&e_after_update);
-    cudaEventCreate(&e_after_g2p);
-
-    cudaEventRecord(e_start, 0);
-
+    // reset_grids kernel
     reset_grids<<<(h_num_g + 511) / 512, 512>>>(m_i, v_i, f_i);
-    cudaEventRecord(e_after_reset, 0);
 
+    // p2g kernel
     p2g<<<(h_num_p + 255) / 256, 256>>>(x_p, v_p, F_p, B_p, m_i, v_i, f_i);
-    cudaEventRecord(e_after_p2g, 0);
 
+    // update_grid kernel
     update_grid<<<(h_num_g + 511) / 512, 512>>>(m_i, v_i, f_i);
-    cudaEventRecord(e_after_update, 0);
 
+    // g2p kernel
     g2p<<<(h_num_p + 255) / 256, 256>>>(v_i, x_p, v_p, F_p, B_p);
-    cudaEventRecord(e_after_g2p, 0);
-
-    cudaEventSynchronize(e_after_g2p);
-
-    float t_reset_ms = 0.f, t_p2g_ms = 0.f, t_update_ms = 0.f, t_g2p_ms = 0.f, t_total_ms = 0.f;
-    cudaEventElapsedTime(&t_reset_ms, e_start, e_after_reset);
-    cudaEventElapsedTime(&t_p2g_ms, e_after_reset, e_after_p2g);
-    cudaEventElapsedTime(&t_update_ms, e_after_p2g, e_after_update);
-    cudaEventElapsedTime(&t_g2p_ms, e_after_update, e_after_g2p);
-    cudaEventElapsedTime(&t_total_ms, e_start, e_after_g2p);
-
-    std::printf("substep ms: reset=%.3f, p2g=%.3f, update=%.3f, g2p=%.3f, total=%.3f\n",
-                t_reset_ms, t_p2g_ms, t_update_ms, t_g2p_ms, t_total_ms);
-
-    cudaEventDestroy(e_start);
-    cudaEventDestroy(e_after_reset);
-    cudaEventDestroy(e_after_p2g);
-    cudaEventDestroy(e_after_update);
-    cudaEventDestroy(e_after_g2p);
 }
 
-void export_to_obj(const std::string& obj_path, float *d_x_p, int num_p) {
-    float *x_p = (float*)malloc(num_p * 3 * 4);
-    cudaMemcpy(x_p, d_x_p, num_p * 3 * 4, cudaMemcpyDeviceToHost);
-
-    std::ofstream file(obj_path);
-    for (int i = 0; i < num_p; i++) {
-        file << "v " << x_p[i * 3 + 0] << " " << x_p[i * 3 + 1] << " " << x_p[i * 3 + 2] << std::endl;
-    }
-    file.close();
-}
